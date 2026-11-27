@@ -16,6 +16,13 @@ import {
   touchRunManifest,
   updateRunManifest,
 } from "./run-state";
+import {
+  agentMessageText,
+  notificationThreadId,
+  notificationTurnId,
+  runTurnHook,
+  turnCompletedStatus,
+} from "./turn-hook";
 import { connectWs, type WsClient } from "./ws-client";
 
 const CODEX_PROXY_BASE_PORT = 4600;
@@ -35,6 +42,8 @@ const THREAD_READ_METHOD = "thread/read";
 const THREAD_RESUME_METHOD = "thread/resume";
 const THREAD_START_METHOD = "thread/start";
 const TURN_COMPLETED_METHOD = "turn/completed";
+const ITEM_COMPLETED_METHOD = "item/completed";
+const MAX_REMEMBERED_AGENT_MESSAGES = 64;
 const TURN_STARTED_METHOD = "turn/started";
 const TURN_START_METHOD = "turn/start";
 const TURN_STEER_METHOD = "turn/steer";
@@ -74,6 +83,7 @@ interface PendingUpstreamRequest {
 }
 
 type StopReason = "dead-tmux" | "inactive-run";
+type ProxyStopReason = StopReason | "reconnect-exhausted" | "signal";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
@@ -328,6 +338,7 @@ const reconnectDelayMs = (attempt: number): number =>
 class CodexTmuxProxy {
   private readonly activeTurnIds = new Set<string>();
   private readonly bridgeRequests = new Map<string, BridgeRequest>();
+  private readonly lastAgentMessages = new Map<string, string>();
   private readonly port: number;
   private remoteUrl: string;
   private readonly routes = new Map<number, ProxyRoute>();
@@ -422,11 +433,19 @@ class CodexTmuxProxy {
     await this.stoppedPromise;
   }
 
-  stop(): void {
+  stop(reason: ProxyStopReason = "signal"): void {
     if (this.stopped) {
       return;
     }
     this.stopped = true;
+    if (this.threadId) {
+      runTurnHook(this.runDir, {
+        event: "proxy-stop",
+        reason,
+        stoppedAt: new Date().toISOString(),
+        threadId: this.threadId,
+      });
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
@@ -653,7 +672,7 @@ class CodexTmuxProxy {
         !(this.stopped || this.upstream) &&
         this.reconnectAttemptCount >= PROXY_UPSTREAM_RECONNECT_MAX_ATTEMPTS
       ) {
-        this.stop();
+        this.stop("reconnect-exhausted");
       }
       return;
     }
@@ -675,7 +694,7 @@ class CodexTmuxProxy {
       if (stopReason === "dead-tmux") {
         clearStaleTmuxBridgeState(this.runDir);
       }
-      this.stop();
+      this.stop(stopReason);
       return;
     }
     try {
@@ -696,7 +715,7 @@ class CodexTmuxProxy {
       if (stopReason === "dead-tmux") {
         clearStaleTmuxBridgeState(this.runDir);
       }
-      this.stop();
+      this.stop(stopReason);
       return;
     }
     this.scheduleReconnect();
@@ -882,6 +901,11 @@ class CodexTmuxProxy {
   }
 
   private handleNotification(frame: JsonFrame): void {
+    if (frame.method === ITEM_COMPLETED_METHOD) {
+      this.rememberAgentMessage(frame.params);
+      return;
+    }
+
     if (frame.method === TURN_STARTED_METHOD) {
       const turnId = extractTurnId(frame.params);
       if (turnId) {
@@ -899,7 +923,52 @@ class CodexTmuxProxy {
         this.activeTurnIds.clear();
       }
       this.turnInProgress = this.activeTurnIds.size > 0;
+      this.emitTurnCompleted(frame.params);
     }
+  }
+
+  // Opt-in turn hook (turn-hook.ts): remember the final agentMessage text per turn of the run
+  // thread, then report each run-thread turn/completed to `<runDir>/.loop-managed/turn-hook.json`.
+  private rememberAgentMessage(params: unknown): void {
+    const text = agentMessageText(params);
+    const turnId = notificationTurnId(params);
+    if (!(text && turnId)) {
+      return;
+    }
+    const threadId = notificationThreadId(params);
+    if (threadId && threadId !== this.threadId) {
+      return;
+    }
+    this.lastAgentMessages.delete(turnId);
+    this.lastAgentMessages.set(turnId, text);
+    if (this.lastAgentMessages.size > MAX_REMEMBERED_AGENT_MESSAGES) {
+      const oldest = this.lastAgentMessages.keys().next().value;
+      if (oldest !== undefined) {
+        this.lastAgentMessages.delete(oldest);
+      }
+    }
+  }
+
+  private emitTurnCompleted(params: unknown): void {
+    const threadId = notificationThreadId(params);
+    if (!threadId || threadId !== this.threadId) {
+      return;
+    }
+    const turnId = notificationTurnId(params);
+    const lastAgentMessage = turnId
+      ? (this.lastAgentMessages.get(turnId) ?? null)
+      : null;
+    if (turnId) {
+      this.lastAgentMessages.delete(turnId);
+    }
+    runTurnHook(this.runDir, {
+      completedAt: new Date().toISOString(),
+      event: "turn-completed",
+      lastAgentMessage,
+      status: turnCompletedStatus(params) ?? null,
+      threadId,
+      turnId: turnId ?? null,
+    });
   }
 
   private stopReason(): StopReason | undefined {
@@ -933,7 +1002,7 @@ class CodexTmuxProxy {
       if (stopReason === "dead-tmux") {
         clearStaleTmuxBridgeState(this.runDir);
       }
-      this.stop();
+      this.stop(stopReason);
       return;
     }
     const threadId = this.resolveThreadId();

@@ -8,8 +8,14 @@ export const CAPABILITIES_FLAG = "--capabilities";
 // fresh agent on a host-created task barrier until the host verifies the launch (see tmux.ts).
 export const HOST_MANAGED_STARTUP_CAPABILITY = "host-managed-startup=1";
 
+// Opt-in Codex turn hook: when `<runDir>/.loop-managed/turn-hook.json` exists, the Codex tmux
+// proxy spawns its argv detached on each run-thread `turn/completed` and once on proxy stop (see
+// turn-hook.ts). Without the file nothing changes.
+export const CODEX_TURN_HOOK_CAPABILITY = "codex-turn-hook=1";
+
 export const LOOP_CAPABILITIES: readonly string[] = [
   HOST_MANAGED_STARTUP_CAPABILITY,
+  CODEX_TURN_HOOK_CAPABILITY,
 ];
 
 export const renderCapabilities = (): string => LOOP_CAPABILITIES.join("\n");

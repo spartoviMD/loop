@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   CAPABILITIES_FLAG,
+  CODEX_TURN_HOOK_CAPABILITY,
   HOST_MANAGED_STARTUP_CAPABILITY,
   LOOP_CAPABILITIES,
   renderCapabilities,
@@ -20,4 +21,9 @@ test("renderCapabilities prints one exact token per line", () => {
   for (const line of lines) {
     expect(line).toMatch(CAPABILITY_TOKEN_RE);
   }
+});
+
+test("codex turn hook capability is an exact machine-readable token", () => {
+  expect(CODEX_TURN_HOOK_CAPABILITY).toBe("codex-turn-hook=1");
+  expect(renderCapabilities().split("\n")).toContain("codex-turn-hook=1");
 });

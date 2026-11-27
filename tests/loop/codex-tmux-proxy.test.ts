@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ServerWebSocket, serve } from "bun";
@@ -19,6 +19,10 @@ import {
   updateRunManifest,
   writeRunManifest,
 } from "../../src/loop/run-state";
+import {
+  setTurnHookSpawnerForTest,
+  turnHookPath,
+} from "../../src/loop/turn-hook";
 
 const bridgeMessage = {
   at: "2026-03-29T00:00:00.000Z",
@@ -974,3 +978,221 @@ test("codex tmux proxy falls back to a fresh bridge turn when steer fails after 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+const runTurnHookProxyScenario = async (withHookFile: boolean) => {
+  const root = makeTempDir();
+  const manifestPath = join(root, "manifest.json");
+  const hookCalls: Array<{ argv: string[]; payload: Record<string, unknown> }> =
+    [];
+  setTurnHookSpawnerForTest((argv, stdin) => {
+    hookCalls.push({ argv, payload: JSON.parse(stdin) });
+  });
+  if (withHookFile) {
+    mkdirSync(join(root, ".loop-managed"), { recursive: true });
+    writeFileSync(
+      turnHookPath(root),
+      JSON.stringify({
+        argv: ["/abs/owner-event", "hook", "--vendor", "codex"],
+      })
+    );
+  }
+  const notify = (
+    ws: ServerWebSocket<{ initialized: boolean }>,
+    method: string,
+    params: Record<string, unknown>
+  ): void => {
+    ws.send(JSON.stringify({ method, params }));
+  };
+  let upstreamServer: ReturnType<typeof serve> | undefined;
+  const upstreamStart = await startServerWithRetries((port) =>
+    serve({
+      fetch: (request, server) =>
+        server.upgrade(request, { data: { initialized: false } })
+          ? undefined
+          : new Response("upstream"),
+      hostname: "127.0.0.1",
+      port,
+      websocket: {
+        message: (ws, message) => {
+          const payload =
+            typeof message === "string" ? message : message.toString();
+          for (const raw of payload.split("\n")) {
+            if (!raw.trim()) {
+              continue;
+            }
+            const frame = JSON.parse(raw) as JsonFrame;
+            if (frame.method === "initialize") {
+              ws.send(JSON.stringify({ id: frame.id, result: {} }));
+              continue;
+            }
+            if (frame.method === "turn/start") {
+              ws.send(
+                JSON.stringify({
+                  id: frame.id,
+                  result: { turn: { id: "t-1" } },
+                })
+              );
+              notify(ws, "turn/started", {
+                threadId: "thread-1",
+                turn: { id: "t-1", status: "inProgress" },
+              });
+              notify(ws, "item/completed", {
+                item: { id: "i-1", text: "draft", type: "agentMessage" },
+                threadId: "thread-1",
+                turnId: "t-1",
+              });
+              notify(ws, "item/completed", {
+                item: {
+                  id: "i-2",
+                  text: "Done.\nTurn: drafted it — next: review",
+                  type: "agentMessage",
+                },
+                threadId: "thread-1",
+                turnId: "t-1",
+              });
+              notify(ws, "turn/completed", {
+                threadId: "thread-1",
+                turn: { id: "t-1", status: "completed" },
+              });
+              notify(ws, "turn/completed", {
+                threadId: "foreign-thread",
+                turn: { id: "f-1", status: "completed" },
+              });
+              notify(ws, "turn/completed", {
+                threadId: "thread-1",
+                turn: { id: "t-2", status: "failed" },
+              });
+              notify(ws, "turn/completed", {
+                threadId: "thread-1",
+                turn: { id: "t-3", status: "interrupted" },
+              });
+            }
+          }
+        },
+      },
+    })
+  );
+  upstreamServer = upstreamStart.server;
+  const upstreamUrl = `ws://127.0.0.1:${upstreamStart.port}/`;
+  writeRunManifest(
+    manifestPath,
+    createRunManifest({
+      claudeSessionId: "claude-1",
+      codexRemoteUrl: upstreamUrl,
+      codexThreadId: "thread-1",
+      cwd: "/repo",
+      mode: "paired",
+      pid: 1234,
+      repoId: "repo-123",
+      runId: "9",
+      state: "working",
+      status: "running",
+    })
+  );
+  const tuiMessages: JsonFrame[] = [];
+  let tui: WebSocket | undefined;
+  let proxyTask: Promise<void> | undefined;
+  try {
+    const proxyStart = await startProxyWithRetries(
+      root,
+      upstreamUrl,
+      "thread-1"
+    );
+    proxyTask = proxyStart.proxyTask;
+    tui = new WebSocket(proxyStart.proxyUrl);
+    tui.onmessage = (event) => {
+      tuiMessages.push(JSON.parse(String(event.data)) as JsonFrame);
+    };
+    await new Promise<void>((resolve, reject) => {
+      if (!tui) {
+        reject(new Error("missing tui websocket"));
+        return;
+      }
+      tui.onopen = () => resolve();
+      tui.onerror = () => reject(new Error("failed to open tui websocket"));
+    });
+    tui.send(JSON.stringify({ id: 1, method: "initialize", params: {} }));
+    await waitFor(() => tuiMessages.some((f) => f.id === 1 && f.result), 5000);
+    tui.send(
+      JSON.stringify({
+        id: 2,
+        method: "turn/start",
+        params: {
+          input: [{ text: "go", text_elements: [], type: "text" }],
+          threadId: "thread-1",
+        },
+      })
+    );
+    await waitFor(
+      () =>
+        tuiMessages.filter((f) => f.method === "turn/completed").length >= 4,
+      5000
+    ).catch((error) => {
+      throw new Error(`${error} tui=${JSON.stringify(tuiMessages)}`);
+    });
+    if (withHookFile) {
+      await waitFor(() => hookCalls.length >= 3, 5000);
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  } finally {
+    tui?.close();
+    updateRunManifest(manifestPath, (manifest) =>
+      manifest
+        ? { ...manifest, state: "completed", status: "completed" }
+        : manifest
+    );
+    await Promise.race([
+      proxyTask ?? Promise.resolve(),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
+    upstreamServer?.stop(true);
+    setTurnHookSpawnerForTest(undefined);
+    rmSync(root, { force: true, recursive: true });
+  }
+  return { hookCalls, tuiMessages };
+};
+
+test("codex tmux proxy reports run-thread turn completions to turn-hook.json", async () => {
+  const { hookCalls, tuiMessages } = await runTurnHookProxyScenario(true);
+  // Every notification is still forwarded to the TUI unchanged.
+  expect(tuiMessages.filter((f) => f.method === "turn/completed")).toHaveLength(
+    4
+  );
+  expect(tuiMessages.filter((f) => f.method === "item/completed")).toHaveLength(
+    2
+  );
+  const turns = hookCalls
+    .map((call) => call.payload)
+    .filter((payload) => payload.event === "turn-completed");
+  expect(hookCalls.every((call) => call.argv[0] === "/abs/owner-event")).toBe(
+    true
+  );
+  expect(
+    turns.map((payload) => [
+      payload.turnId,
+      payload.status,
+      payload.lastAgentMessage,
+    ])
+  ).toEqual([
+    ["t-1", "completed", "Done.\nTurn: drafted it — next: review"],
+    ["t-2", "failed", null],
+    ["t-3", "interrupted", null],
+  ]);
+  expect(turns.every((payload) => payload.threadId === "thread-1")).toBe(true);
+  // The proxy stop (the manifest went inactive) is reported once, with its reason.
+  const stops = hookCalls
+    .map((call) => call.payload)
+    .filter((payload) => payload.event === "proxy-stop");
+  expect(stops).toHaveLength(1);
+  expect(stops[0]?.reason).toBe("inactive-run");
+  expect(stops[0]?.threadId).toBe("thread-1");
+}, 20_000);
+
+test("codex tmux proxy spawns nothing without turn-hook.json", async () => {
+  const { hookCalls, tuiMessages } = await runTurnHookProxyScenario(false);
+  expect(tuiMessages.filter((f) => f.method === "turn/completed")).toHaveLength(
+    4
+  );
+  expect(hookCalls).toEqual([]);
+}, 20_000);
